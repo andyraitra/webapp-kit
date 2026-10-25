@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# webapp-install - turn a website into a standalone desktop application.
+#
+# Writes a freedesktop .desktop entry that opens the site in a Chromium-based
+# browser's --app mode (no tabs, no address bar) with its own icon.
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+readonly PROG="webapp-install"
+readonly MAX_NAME_LENGTH=64
+readonly MIN_AUTO_ICON_SIZE=64
+readonly MAX_ICON_BYTES=$((5 * 1024 * 1024))
+readonly MAX_PAGE_BYTES=$((2 * 1024 * 1024))
+readonly MAX_ICON_CANDIDATES=6
+readonly MAX_REDIRECTS=5
+readonly FALLBACK_ICON="web-browser"
+readonly URL_ALLOWED="^[]A-Za-z0-9._~:/?#@!&'()*+,;=%[-]+$"
+readonly USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+readonly DASHBOARD_ICONS="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png"
+readonly GOOGLE_FAVICONS="https://www.google.com/s2/favicons"
+# Preferred order when WEBAPP_BROWSER is not set.
+readonly BROWSERS=(brave-browser brave chromium chromium-browser google-chrome-stable
+  google-chrome microsoft-edge-stable vivaldi-stable)
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [--] "<Name>" <url> [icon]
+
+Install a website as a desktop application.
+
+Arguments:
+  Name   Display name (max $MAX_NAME_LENGTH characters)
+  url    http:// or https:// address of the web app
+  icon   Optional PNG or SVG icon, as a local path or an http(s) URL.
+         Without it, the icon is looked up automatically.
+
+Options:
+  -h, --help     Show this help
+  -V, --version  Show the version
+
+Environment:
+  WEBAPP_BROWSER  Chromium-based browser command to use (default: first found
+                  among ${BROWSERS[*]})
+  XDG_DATA_HOME   Base data directory (default: ~/.local/share)
+
+Example:
+  $PROG "WhatsApp" https://web.whatsapp.com/
+EOF
+}
+
+die() {
+  printf '%s: error: %s\n' "$PROG" "$1" >&2
+  exit "${2:-1}"
+}
+
+warn() {
+  printf '%s: warning: %s\n' "$PROG" "$1" >&2
+}
+
+slugify() {
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//'
+}
+
+validate_name() {
+  local name="$1"
+  [[ -n "$name" ]] || die "the name must not be empty"
+  [[ "$name" != *[[:cntrl:]]* ]] || die "the name must not contain control characters"
+  ((${#name} <= MAX_NAME_LENGTH)) || die "the name must be at most $MAX_NAME_LENGTH characters"
+}
+
+# Only RFC 3986 characters are allowed, minus the ones that are special inside
+# a quoted desktop-entry Exec argument (" ` $ \) and whitespace, so the URL can
+# never break out of its argument.
+validate_url() {
+  local url="$1" authority host LC_ALL=C
+  [[ "$url" =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]] || die "the URL must start with http:// or https://"
+  [[ "$url" =~ $URL_ALLOWED ]] ||
+    die "the URL contains characters that are not allowed (spaces, quotes, \`, \$ or \\); percent-encode them"
+  authority="${url#*://}"
+  authority="${authority%%[/?#]*}"
+  [[ "$authority" != *@* ]] || die "the URL must not contain credentials"
+  host=$(url_host "$url")
+  [[ -n "$host" && "$host" != "[]" ]] || die "the URL has no host"
+}
+
+# Print the lowercased host of an http(s) URL, without port. IPv6 literals keep
+# their brackets.
+url_host() {
+  local host="${1#*://}" LC_ALL=C
+  host="${host%%[/?#]*}"
+  if [[ "$host" == \[* ]]; then
+    host="${host%%]*}]"
+  else
+    host="${host%%:*}"
+  fi
+  printf '%s' "${host,,}"
+}
+
+# Succeed for hosts on the local machine or a private network. All IPv6
+# literals count as private (public ones are practically never used for
+# icons), and so does any numeric spelling other than a canonical dotted quad
+# (2130706433, 0x7f.1, 0177.0.0.1 all mean 127.0.0.1 to curl).
+is_private_host() {
+  local host="${1%.}" octet LC_ALL=C
+  case "$host" in
+    localhost | *.localhost | \[*) return 0 ;;
+  esac
+  if [[ "$host" =~ ^(0x[0-9a-f]*|[0-9]+)(\.(0x[0-9a-f]*|[0-9]+))*$ ]]; then
+    [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+    for octet in ${host//./ }; do
+      [[ "$octet" == 0 || "$octet" != 0* ]] || return 0
+      ((octet <= 255)) || return 0
+    done
+    case "$host" in
+      0.* | 10.* | 127.* | 169.254.* | 192.168.*) return 0 ;;
+      172.1[6-9].* | 172.2[0-9].* | 172.3[01].*) return 0 ;;
+      100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+# Succeed when an icon candidate may be fetched on behalf of a page on
+# $2: a plain ASCII host name or IP with no userinfo (nothing curl could glob
+# or reinterpret), and not local/private unless the page itself is.
+candidate_allowed() {
+  local authority="${1#*://}" host LC_ALL=C
+  authority="${authority%%[/?#]*}"
+  [[ "$authority" != *@* ]] || return 1
+  host=$(url_host "$1")
+  [[ "$host" =~ ^[a-z0-9.-]+$ || "$host" =~ ^\[[0-9a-f:.]+\]$ ]] || return 1
+  [[ "$host" != *. ]] || return 1
+  is_private_host "$2" || ! is_private_host "$host"
+}
+
+pick_browser() {
+  local browser
+  if [[ -n "${WEBAPP_BROWSER:-}" ]]; then
+    [[ "$WEBAPP_BROWSER" =~ ^[A-Za-z0-9._/+-]+$ ]] || die "WEBAPP_BROWSER must be a plain command name or path"
+    [[ "$WEBAPP_BROWSER" != */* || "$WEBAPP_BROWSER" == /* ]] ||
+      die "WEBAPP_BROWSER must be a command name or an absolute path"
+    command -v "$WEBAPP_BROWSER" >/dev/null 2>&1 || die "WEBAPP_BROWSER '$WEBAPP_BROWSER' was not found"
+    printf '%s' "$WEBAPP_BROWSER"
+    return
+  fi
+  for browser in "${BROWSERS[@]}"; do
+    if command -v "$browser" >/dev/null 2>&1; then
+      printf '%s' "$browser"
+      return
+    fi
+  done
+  die "no Chromium-based browser found (tried: ${BROWSERS[*]}); install one or set WEBAPP_BROWSER"
+}
+
+# Chromium names --app windows "<prefix>-<host>_<path>-<profile>" (path with
+# "/" replaced by "_"). Matching it in StartupWMClass lets the dock group the
+# window under this launcher instead of the browser.
+wm_class_for() {
+  local browser="$1" url="$2" prefix rest path
+  case "${browser##*/}" in
+    brave*) prefix="brave" ;;
+    chromium*) prefix="chromium" ;;
+    google-chrome*) prefix="chrome" ;;
+    microsoft-edge*) prefix="msedge" ;;
+    vivaldi*) prefix="vivaldi" ;;
+    *) prefix="${browser##*/}" && prefix="${prefix%%-*}" ;;
+  esac
+  rest="${url#*://}"
+  rest="${rest%%[?#]*}"
+  if [[ "$rest" == */* ]]; then
+    path="/${rest#*/}"
+  else
+    path="/"
+  fi
+  printf '%s-%s_%s-Default' "$prefix" "$(url_host "$url")" "${path//\//_}"
+}
+
+# Escape a value for a desktop entry string key.
+desktop_escape() {
+  local value="${1//\\/\\\\}"
+  printf '%s' "$value"
+}
+
+fetch() {
+  local url="$1" out="$2" max="$3"
+  shift 3
+  curl -fsSL --globoff --proto =http,https --proto-redir =http,https --max-time 15 \
+    --max-filesize "$max" -A "$USER_AGENT" -o "$out" "$@" "$url" 2>/dev/null
+}
+
+# Like fetch, for URLs taken from a web page: redirects are followed by hand so
+# that every hop goes through candidate_allowed for the page host $4.
+fetch_candidate() {
+  local url="$1" out="$2" max="$3" page_host="$4" hops=0 next
+  while :; do
+    candidate_allowed "$url" "$page_host" || return 1
+    next=$(curl -fsS --globoff --proto =http,https --max-redirs 0 --max-time 15 \
+      --max-filesize "$max" -A "$USER_AGENT" -o "$out" -w '%{redirect_url}' "$url" 2>/dev/null) || return 1
+    [[ -n "$next" ]] || return 0
+    ((++hops <= MAX_REDIRECTS)) || return 1
+    [[ "$next" =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]] || return 1
+    url="$next"
+  done
+}
+
+# Print "png" or "svg" when the file is a usable icon, fail otherwise.
+icon_type() {
+  case "$(file -b --mime-type "$1" 2>/dev/null)" in
+    image/png) printf 'png' ;;
+    image/svg+xml) printf 'svg' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Succeed when the file is an SVG or a PNG at least min x min pixels.
+icon_big_enough() {
+  local file="$1" min="$2" type dims w h
+  type=$(icon_type "$file") || return 1
+  [[ "$type" == "svg" ]] && return 0
+  dims=$(file -b "$file" | grep -oE '[0-9]+ x [0-9]+' | head -1) || return 1
+  w="${dims%% x *}"
+  h="${dims##* x }"
+  ((w >= min && h >= min))
+}
+
+# Resolve an href found in a page against the page's final URL.
+resolve_href() {
+  local href="$1" base="$2" origin scheme dir
+  scheme="${base%%://*}"
+  origin="${base#*://}"
+  origin="$scheme://${origin%%[/?#]*}"
+  dir="${base%%[?#]*}"
+  [[ "${dir#*://}" == */* ]] && dir="${dir%/*}" || dir="$origin"
+  case "$href" in
+    [Hh][Tt][Tt][Pp]://* | [Hh][Tt][Tt][Pp][Ss]://*) printf '%s' "$href" ;;
+    //*) printf '%s:%s' "$scheme" "$href" ;;
+    /*) printf '%s%s' "$origin" "$href" ;;
+    *:*) return 1 ;;
+    *) printf '%s/%s' "$dir" "$href" ;;
+  esac
+}
+
+# Print the value of attribute $2 in tag $1 (double-, single- or unquoted).
+tag_attr() {
+  printf '%s' "$1" | grep -ioE "[[:space:]]$2=(\"[^\"]*\"|'[^']*'|[^[:space:]\"'>]+)" | head -1 |
+    sed -E "s/^[[:space:]][^=]*=//; s/^[\"']//; s/[\"']\$//"
+}
+
+# Print candidate icon URLs declared by the page, best first: apple-touch-icon,
+# then rel=icon by declared size (SVG and sizes=any first), at most
+# MAX_ICON_CANDIDATES of them, then the conventional /apple-touch-icon.png.
+site_icon_candidates() {
+  local url="$1" page="$2" final link rel href sizes rank origin
+  final=$(fetch "$url" "$page" "$MAX_PAGE_BYTES" -w '%{url_effective}') || final="$url"
+  [[ -n "$final" ]] || final="$url"
+  if [[ -s "$page" ]]; then
+    while IFS= read -r link; do
+      rel=" $(tag_attr "$link" rel | tr '[:upper:]' '[:lower:]') "
+      href=$(tag_attr "$link" href | sed 's/&amp;/\&/g')
+      [[ -n "$href" ]] || continue
+      href=$(resolve_href "$href" "$final") || continue
+      case "$rel" in
+        *" apple-touch-icon "* | *" apple-touch-icon-precomposed "*) rank=100000 ;;
+        *" icon "*)
+          sizes=$(tag_attr "$link" sizes | tr '[:upper:]' '[:lower:]')
+          if [[ "$sizes" == "any" || "$(tag_attr "$link" type)" == *svg* || "${href%%[?#]*}" == *.svg ]]; then
+            rank=50000
+          else
+            rank=$(printf '%s' "$sizes" | grep -oE '[0-9]+x' | tr -d x | sort -n | tail -1)
+            rank="${rank:-0}"
+          fi
+          ;;
+        *) continue ;;
+      esac
+      printf '%s\t%s\n' "$rank" "$href"
+    done < <(tr '\n\r\t' '   ' <"$page" | grep -ioE '<link[[:space:]][^>]*>' || true) |
+      sort -t$'\t' -k1,1nr -s | cut -f2 |
+      awk -v max="$MAX_ICON_CANDIDATES" 'n < max && !seen[$0]++ { print; n++ }'
+  fi
+  origin="${final#*://}"
+  printf '%s://%s/apple-touch-icon.png\n' "${final%%://*}" "${origin%%[/?#]*}"
+}
+
+# Find the best icon automatically. Prints the downloaded file's type and
+# leaves it in $1, or fails when nothing usable was found.
+auto_icon() {
+  local out="$1" slug="$2" url="$3" host="$4" tmpdir="$5" candidate
+  if fetch "$DASHBOARD_ICONS/$slug.png" "$out" "$MAX_ICON_BYTES" &&
+    icon_big_enough "$out" "$MIN_AUTO_ICON_SIZE"; then
+    icon_type "$out"
+    return
+  fi
+  while IFS= read -r candidate; do
+    if fetch_candidate "$candidate" "$out" "$MAX_ICON_BYTES" "$host" &&
+      icon_big_enough "$out" "$MIN_AUTO_ICON_SIZE"; then
+      icon_type "$out"
+      return
+    fi
+  done < <(site_icon_candidates "$url" "$tmpdir/page.html" | awk '!seen[$0]++')
+  # Never leak intranet host names to Google.
+  is_private_host "$host" && return 1
+  # Google answers with a generic globe when it has nothing, so no -f here.
+  if curl -sSL --globoff --proto =https --proto-redir =https --max-time 15 --max-filesize "$MAX_ICON_BYTES" \
+    -A "$USER_AGENT" -o "$out" "$GOOGLE_FAVICONS?domain=$host&sz=256" 2>/dev/null &&
+    icon_type "$out" >/dev/null; then
+    warn "no high-resolution icon found, using a low-resolution favicon; pass an icon as 3rd argument for a better one"
+    icon_type "$out"
+    return
+  fi
+  return 1
+}
+
+tmpdir=""
+staged=()
+cleanup() {
+  [[ -z "$tmpdir" ]] || rm -rf -- "$tmpdir"
+  ((${#staged[@]} == 0)) || rm -f -- "${staged[@]}"
+}
+
+# Create a hidden staging file in directory $1 and store its path in
+# $staged_file, so the final mv is an atomic rename on the same filesystem.
+# Not meant for $(...): the file must be registered for cleanup in this shell.
+staged_file=""
+stage_in() {
+  staged_file=$(mktemp "$1/.webapp-XXXXXX") || die "cannot write to $1"
+  staged+=("$staged_file")
+}
+
+main() {
+  local positional=()
+  while (($#)); do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -V | --version)
+        printf '%s %s\n' "$PROG" "$VERSION"
+        exit 0
+        ;;
+      --)
+        shift
+        positional+=("$@")
+        break
+        ;;
+      -?*)
+        printf '%s: error: unknown option %s\n\n' "$PROG" "$1" >&2
+        usage >&2
+        exit 2
+        ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  if ((${#positional[@]} < 2 || ${#positional[@]} > 3)); then
+    usage >&2
+    exit 2
+  fi
+
+  local name="${positional[0]}" url="${positional[1]}" icon_src="${positional[2]:-}"
+  validate_name "$name"
+  validate_url "$url"
+  local slug
+  slug=$(slugify "$name")
+  [[ -n "$slug" ]] || die "the name must contain at least one letter or digit"
+
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  command -v file >/dev/null 2>&1 || die "file is required"
+  local browser
+  browser=$(pick_browser)
+
+  local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local apps_dir="$data_home/applications"
+  local icons_dir="$data_home/icons/webapps"
+  local host
+  host=$(url_host "$url")
+
+  tmpdir=$(mktemp -d)
+  trap cleanup EXIT
+
+  local icon_tmp="$tmpdir/icon" icon_ext=""
+  if [[ -n "$icon_src" ]]; then
+    if [[ "$icon_src" =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]]; then
+      fetch "$icon_src" "$icon_tmp" "$MAX_ICON_BYTES" || die "could not download the icon from $icon_src"
+    else
+      [[ -f "$icon_src" ]] || die "icon file not found: $icon_src"
+      cp -- "$icon_src" "$icon_tmp"
+    fi
+    icon_ext=$(icon_type "$icon_tmp") || die "the icon must be a PNG or SVG image"
+  else
+    icon_ext=$(auto_icon "$icon_tmp" "$slug" "$url" "$host" "$tmpdir") || icon_ext=""
+  fi
+
+  mkdir -p -- "$apps_dir" "$icons_dir"
+  local desktop="$apps_dir/webapp-$slug.desktop" action="Installed"
+  [[ -e "$desktop" ]] && action="Updated"
+
+  local icon_value="$FALLBACK_ICON" ext
+  if [[ -n "$icon_ext" ]]; then
+    stage_in "$icons_dir"
+    cp -- "$icon_tmp" "$staged_file"
+    chmod 644 -- "$staged_file"
+    icon_value="$icons_dir/$slug.$icon_ext"
+    mv -- "$staged_file" "$icon_value"
+    for ext in png svg; do
+      if [[ "$ext" != "$icon_ext" ]]; then
+        rm -f -- "$icons_dir/$slug.$ext"
+      fi
+    done
+  else
+    for ext in png svg; do
+      if [[ -f "$icons_dir/$slug.$ext" ]]; then
+        icon_value="$icons_dir/$slug.$ext"
+      fi
+    done
+    if [[ "$icon_value" == "$FALLBACK_ICON" ]]; then
+      warn "no icon found, using the generic '$FALLBACK_ICON' icon"
+    else
+      warn "no icon found, keeping the current icon"
+    fi
+  fi
+
+  local exec_url="${url//%/%%}" safe_name
+  safe_name=$(desktop_escape "$name")
+  stage_in "$apps_dir"
+  cat >"$staged_file" <<EOF
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=$safe_name
+Comment=$safe_name web app
+Exec=$browser --new-window --ozone-platform-hint=auto "--app=$exec_url"
+Icon=$icon_value
+StartupWMClass=$(wm_class_for "$browser" "$url")
+StartupNotify=true
+Terminal=false
+Categories=Network;
+X-WebappKit-Version=$VERSION
+EOF
+  chmod 644 -- "$staged_file"
+  mv -- "$staged_file" "$desktop"
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$apps_dir" 2>/dev/null || true
+  fi
+  printf '%s %s (%s)\n' "$action" "$name" "$desktop"
+}
+
+main "$@"

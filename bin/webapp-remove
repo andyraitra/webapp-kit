@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# webapp-remove - remove a web app installed with webapp-install, or list them.
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+readonly PROG="webapp-remove"
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [--] ["<Name>"]
+
+Remove a web app installed with webapp-install.
+Without a name, list the installed web apps.
+
+Options:
+  -h, --help     Show this help
+  -V, --version  Show the version
+EOF
+}
+
+die() {
+  printf '%s: error: %s\n' "$PROG" "$1" >&2
+  exit "${2:-1}"
+}
+
+slugify() {
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//'
+}
+
+list_apps() {
+  local apps_dir="$1" desktop name names=()
+  for desktop in "$apps_dir"/webapp-*.desktop; do
+    [[ -f "$desktop" ]] || continue
+    name=$(grep -m1 '^Name=' "$desktop" | cut -d= -f2- | sed 's/\\\\/\\/g' || true)
+    if [[ -z "$name" ]]; then
+      name="${desktop##*/webapp-}"
+      name="${name%.desktop}"
+    fi
+    names+=("$name")
+  done
+  if ((${#names[@]} == 0)); then
+    printf 'No web apps installed.\n'
+    return
+  fi
+  printf 'Installed web apps:\n'
+  printf '%s\n' "${names[@]}" | LC_ALL=C sort -f | sed 's/^/  /'
+}
+
+main() {
+  local positional=()
+  while (($#)); do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -V | --version)
+        printf '%s %s\n' "$PROG" "$VERSION"
+        exit 0
+        ;;
+      --)
+        shift
+        positional+=("$@")
+        break
+        ;;
+      -?*)
+        printf '%s: error: unknown option %s\n\n' "$PROG" "$1" >&2
+        usage >&2
+        exit 2
+        ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  if ((${#positional[@]} > 1)); then
+    usage >&2
+    exit 2
+  fi
+
+  local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local apps_dir="$data_home/applications"
+  local icons_dir="$data_home/icons/webapps"
+
+  if ((${#positional[@]} == 0)); then
+    list_apps "$apps_dir"
+    return
+  fi
+
+  local name="${positional[0]}" slug
+  slug=$(slugify "$name")
+  [[ -n "$slug" ]] || die "no web app named \"$name\""
+  local desktop="$apps_dir/webapp-$slug.desktop"
+  [[ -f "$desktop" ]] || die "no web app named \"$name\" (run $PROG without arguments to list them)"
+
+  rm -f -- "$desktop" "$icons_dir/$slug.png" "$icons_dir/$slug.svg"
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$apps_dir" 2>/dev/null || true
+  fi
+  printf 'Removed %s\n' "$name"
+}
+
+main "$@"

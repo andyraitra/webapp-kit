@@ -1,0 +1,38 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include the exact command you ran and its output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: webapp-kit version
+      description: Output of `webapp-install --version`
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Distribution and desktop
+      placeholder: Pop!_OS 24.04, COSMIC (Wayland)
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+      placeholder: Brave 1.80
+    validations:
+      required: true
